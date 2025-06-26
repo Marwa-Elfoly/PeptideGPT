@@ -250,3 +250,78 @@ from PeptideBERT.model.utils import train, validate, test
 
 
 save_dir = args.pred_model_path
+
+config = yaml.load(open(save_dir + '/config.yaml', 'r'), Loader=yaml.FullLoader)
+config['device'] = device
+
+peptideBERT_model = create_model(config)
+
+
+peptideBERT_model.load_state_dict(torch.load(f'{save_dir}/model.pt')['model_state_dict'], strict=False)
+
+
+m2 = dict(zip(
+    ['[PAD]','[UNK]','[CLS]','[SEP]','[MASK]','L',
+    'A','G','V','E','S','I','K','R','D','T','P','N',
+    'Q','F','Y','M','H','C','W','X','U','B','Z','O'],
+    range(30)
+))
+
+def f(seq):
+    seq = map(lambda x: m2[x], seq)
+    seq = torch.tensor([*seq], dtype=torch.long).unsqueeze(0).to(device)
+    attn = torch.tensor(seq > 0, dtype=torch.long).to(device)
+
+    return seq, attn
+
+df_preds = pd.DataFrame()
+
+scores = {}
+
+print('Starting protein property predictions...')
+
+peptides_to_exclude = "XUBZOJ"
+
+best_prots = remove_prots_with(best_prots, peptides_to_exclude)
+
+
+for seq in tqdm(best_prots):
+
+    
+
+    seq = seq.replace('\n', '')
+
+
+
+    score = peptideBERT_model(*f(seq)).item()
+
+    scores[seq] = score
+
+print('Property prediction completed.')
+
+df_preds['Sequence'] = scores.keys()
+df_preds['Score'] = scores.values()
+df_preds['Property'] = df_preds['Score'] > 0.5
+
+total_proteins_with_property = np.sum(np.array(list(scores.values())) > 0.5)
+
+property_probability = total_proteins_with_property/len(best_prots)
+
+# Save Predictions to CSV
+df_preds.to_csv(args.output_dir + '/predictions.csv', index=False)
+
+print('Inference Complete')
+
+with open(args.output_dir + '/info.txt', 'w') as file:
+    # Write 'print('hello world')' to the file
+    file.write(f'Total generated sequences {args.num_return_sequences} out of which top {args.num_return_sequences//3} sequences based on perplexity were chosen.\n')
+    file.write(f'Total sequences which passed protein validty check {len(filtered_prots)}, rejected {len(top_prots) - len(filtered_prots)} or {((len(top_prots) - len(filtered_prots))/len(top_prots) * 100):.3f}%\n')
+    file.write(f'Total proteins which had plDDT > 0.7 from ESMFold are {len(best_prots)}, {(len(best_prots)/len(filtered_prots)*100):.3f}% of valid generated proteins\n')
+    file.write(f'{total_proteins_with_property}/{len(best_prots)} had the desired property, which is {property_probability:.4f} probability.\n')
+    for arg in vars(args):
+        file.write(f"{arg}: {getattr(args, arg)}\n")
+
+print(f'Total generated sequences {args.num_return_sequences} out of which top {args.num_return_sequences//3} sequences based on perplexity were chosen.')
+print(f'Total sequences which passed protein validty check {len(filtered_prots)}, rejected {len(top_prots) - len(filtered_prots)} or {((len(top_prots) - len(filtered_prots))/len(top_prots) * 100):.3f}%')
+print(f'Total proteins which had plDDT > 0.7 from ESMFold are {len(best_prots)}, {(len(best_prots)/len(filtered_prots) * 100):.3f}% of valid generated proteins')
+print(f'{total_proteins_with_property}/{len(best_prots)} had the desired property, which is {property_probability:.4f} probability.')
