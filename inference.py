@@ -103,22 +103,41 @@ filtered_prots = df_valid[df_valid['Valid Protein']]['Sequence'].tolist()
 print(f"✅ {len(filtered_prots)} proteins passed hull validity check.")
 
 # ESMFold Structure
+import re  # ✅ Added
+
+# ESMFold Structure
 esm_model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device)
 esm_tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
 
 plddt_results = []
-for seq in tqdm(filtered_prots):
-    clean_seq = seq.replace('\n', '')
-    inputs = esm_tokenizer([clean_seq], return_tensors="pt", padding=True, truncation=True).to(device)  # ✅ Fixed crash
-    outputs = esm_model(**inputs)
-    plddt_results.append(torch.mean(outputs.plddt).item())
+cleaned_seqs = []  # ✅ Added to keep only safe sequences for downstream use
 
+for seq in tqdm(filtered_prots):
+    clean_seq = seq.replace('\n', '').strip()
+
+    # ✅ Skip empty or invalid sequences (only canonical AAs allowed)
+    if not re.fullmatch(r"[ACDEFGHIKLMNPQRSTVWY]+", clean_seq):
+        continue
+
+    try:
+        inputs = esm_tokenizer([clean_seq], return_tensors="pt", padding=True, truncation=True).to(device)
+        outputs = esm_model(**inputs)
+        plddt_results.append(torch.mean(outputs.plddt).item())
+        cleaned_seqs.append(seq)  # ✅ Track the matching sequence
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"⚠️ Skipping sequence due to error: {e}")
+        continue
+
+# ✅ Update df_valid to only include those that passed the above filtering
 df_valid = df_valid[df_valid['Valid Protein']]
+df_valid = df_valid[df_valid['Sequence'].isin(cleaned_seqs)].copy()  # ✅ Filter to match plDDT list length
 df_valid['plDDT'] = plddt_results
 df_valid['Good Structure'] = df_valid['plDDT'] > 0.7
 df_valid.to_csv(os.path.join(args.output_dir, 'generation_checks.csv'), index=False)
 
 best_prots = df_valid[df_valid['Good Structure']]['Sequence'].tolist()
+
 
 # PeptideBERT
 from PeptideBERT.data.dataloader import load_data
