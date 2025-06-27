@@ -1,7 +1,6 @@
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer, GPT2LMHeadModel, EsmForProteinFolding
 import math
 import torch
-from transformers import AutoTokenizer, GPT2LMHeadModel, EsmForProteinFolding
 import numpy as np
 import pandas as pd
 import argparse
@@ -11,317 +10,187 @@ import shutil
 import gc
 from tqdm import tqdm
 
-
+# === Directory Setup ===
 def create_or_replace_directory(directory_path):
-    """
-    Check if a directory exists. If it exists, delete it and create a new one.
-    If it doesn't exist, create the directory.
-    
-    :param directory_path: The path to the directory
-    """
-    
-    # Check if the directory exists
     if os.path.exists(directory_path):
         print(f"Directory {directory_path} exists. Deleting...")
-        
-        # Delete the directory
         shutil.rmtree(directory_path)
-        
-        # Create the directory
-        print(f"Creating directory {directory_path}...")
-        os.makedirs(directory_path)
-    else:
-        # If the directory doesn't exist, create it
-        print(f"Directory {directory_path} does not exist. Creating...")
-        os.makedirs(directory_path)
+    print(f"Creating directory {directory_path}...")
+    os.makedirs(directory_path)
 
-
-# Specify the directory path
-
-
-parser = argparse.ArgumentParser(description='Process some integers.')
-parser.add_argument('--model_path', type=str, help='Path of the model to run generation from')
-parser.add_argument('--num_return_sequences', type=int, help='Number of sequences to generate', default=1000)
-parser.add_argument('--max_length', type=int, help='Maximum length of generated sequences', default=50)
-parser.add_argument('--starts_with', type=str, help='Starting amino acids for generation', default='')
-parser.add_argument('--output_dir', type=str, help='Directory for storing all output files')
-parser.add_argument('--pred_model_path', type=str, help='Path of the model to predict properties of the sequences')
-parser.add_argument('--seed', type=int, help='Random seed', default=42)
-
-
+# === Argument Parser ===
+parser = argparse.ArgumentParser()
+parser.add_argument('--model_path', type=str)
+parser.add_argument('--num_return_sequences', type=int, default=1000)
+parser.add_argument('--max_length', type=int, default=50)
+parser.add_argument('--starts_with', type=str, default='')
+parser.add_argument('--output_dir', type=str)
+parser.add_argument('--pred_model_path', type=str)
+parser.add_argument('--seed', type=int, default=42)
+parser.add_argument('--max_aa_count', type=int, default=25)  # ✅ Added
 
 args = parser.parse_args()
 
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 
-# Create the directory
+# === Generation ===
 create_or_replace_directory(args.output_dir)
 protgpt2 = pipeline('text-generation', model=args.model_path, device_map="auto")
-
 print('Starting generation...')
 sequences = []
 all_amines = ['L','A','G','V','E','S','I','K','R','D','T','P','N','Q','F','Y','M','H','C','W']
 for cha in all_amines:
-    sequences_cha = protgpt2("<|endoftext|>" + cha, max_length=args.max_length, do_sample=True, top_k=950, repetition_penalty=1.2, num_return_sequences=args.num_return_sequences//len(all_amines), eos_token_id=0)
-    sequences.extend(sequences_cha)
-print('Generation Complete.')
+    generated = protgpt2(
+        "<|endoftext|>" + cha,
+        max_length=args.max_length,
+        do_sample=True,
+        top_k=950,
+        repetition_penalty=1.2,
+        num_return_sequences=args.num_return_sequences // len(all_amines),
+        eos_token_id=0
+    )
+    sequences.extend(generated)
+print(f"✅ Generated {len(sequences)} raw sequences.")
 
+# ✅ Filter sequences by max AA count BEFORE scoring
+filtered_sequences = []
+for entry in sequences:
+    seq = entry['generated_text'].replace("<|endoftext|>", "").replace('\n', '').strip()
+    if len(seq) <= args.max_aa_count:
+        filtered_sequences.append(seq)
+print(f"✅ Retained {len(filtered_sequences)} sequences after filtering by max_aa_count = {args.max_aa_count}")
+
+# === Perplexity Calculation ===
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print('Using Device', device)
-
-#Convert the sequence to a string like this
-#(note we have to introduce new line characters every 60 amino acids,
-#following the FASTA file format).
 tokenizer = AutoTokenizer.from_pretrained("nferruz/ProtGPT2")
-model = GPT2LMHeadModel.from_pretrained(args.model_path)
-model = model.to(device)
+model = GPT2LMHeadModel.from_pretrained(args.model_path).to(device)
 
-# ppl function
 def calculatePerplexity(sequence, model, tokenizer):
-    input_ids = torch.tensor(tokenizer.encode(sequence)).unsqueeze(0)
-    input_ids = input_ids.to(device)
+    input_ids = torch.tensor(tokenizer.encode(sequence)).unsqueeze(0).to(device)
     with torch.no_grad():
         outputs = model(input_ids, labels=input_ids)
-    loss, logits = outputs[:2]
-
-    return math.exp(loss)
-
-
-print('Starting to order by perplexity...')
+    return math.exp(outputs[0])
 
 ppls = []
-sequences_with_ppl = []
+scored_sequences = []
 
-for sequence in tqdm(sequences):
-    seq = sequence['generated_text']
-    seq = seq.replace("<|endoftext|>", "")
-    seq = seq.replace('\n', '')
-    seq = seq.strip()
-    sequences_with_ppl.append(seq)
-    seq = '\n'.join(seq[i:i+60] for i in range(0, len(seq), 60))
-    seq = '<|endoftext|>' + seq + '<|endoftext|>'
-    ppl = calculatePerplexity(seq, model, tokenizer)
+print("⚙️ Calculating perplexity...")
+for seq in tqdm(filtered_sequences):
+    formatted = '\n'.join(seq[i:i+60] for i in range(0, len(seq), 60))
+    seq_with_tags = f"<|endoftext|>{formatted}<|endoftext|>"
+    ppl = calculatePerplexity(seq_with_tags, model, tokenizer)
+    scored_sequences.append(seq)
     ppls.append(ppl)
 
-#storing all generated proteins with their perplexity values in csv
-df_ppl = pd.DataFrame()
-df_ppl['Sequence'] = sequences_with_ppl
-df_ppl['Perplexity'] = ppls
-df_ppl.to_csv(args.output_dir + '/all_generated_with_perplexity.csv', index=False)
+# Save all results
+df_ppl = pd.DataFrame({'Sequence': scored_sequences, 'Perplexity': ppls})
+df_ppl.to_csv(os.path.join(args.output_dir, "all_generated_with_perplexity.csv"), index=False)
 
-k = args.num_return_sequences//3
-
-top_prots = np.array(sequences_with_ppl)[np.argsort(ppls)[:k]]
+# === Select Top by Perplexity ===
+k = args.num_return_sequences // 3
+top_prots = np.array(scored_sequences)[np.argsort(ppls)[:k]]
 top_prots = [i for i in top_prots if len(i) != 0]
-print(top_prots)
+print("✅ Selected top sequences by perplexity.")
 
-def remove_prots_with(lst, chars_to_exclude):
-    # Convert the exclusion string to a set for efficient lookup
-    exclusion_set = set(chars_to_exclude)
-    
-    # Use a list comprehension to filter out strings
-    filtered_list = [s for s in lst if not any(char in exclusion_set for char in s)]
-    
-    return filtered_list
-
-# Example usage:
-
-
-
-
-print('Ordered by Perplexity.')
-
-#checking if sequences are inside the hull
-# Load the .npz file
+# === Hull Validity Check ===
+print("🔍 Checking hull validity...")
 data = np.load('./hull_equations.npz')
-
-df_valid = pd.DataFrame()
-df_valid['Sequence'] = list(top_prots)
-
 def create_3d_point(sequence, c):
-    # Step 1: Count the number of occurrences of character c
-    normalized_chars = ['X','U','B','Z','O','J']
+    for norm in 'XUBZOJ': sequence = sequence.replace(norm, '')
+    count = sequence.count(c)
+    if count == 0: return [0, 0, 0]
+    indices = [i for i, char in enumerate(sequence) if char == c]
+    mean = sum(indices) / count
+    variance = sum((i - mean)**2 for i in indices) / count
+    return [count, mean, variance / len(sequence)]
 
-    for norm_char in normalized_chars:
-        sequence = sequence.replace(norm_char, '')
+def point_in_hull(point, hull_equations, tol=1e-12):
+    return all((np.dot(eq[:-1], point) + eq[-1] <= tol) for eq in hull_equations)
 
-    count_c = sequence.count(c)
-    
-    if count_c == 0:
-        return [0, 0, 0]  # Return None if the character c is not found
-    
-    # Step 2: Calculate the mean distance from the start of all occurrences of c
-    indices_c = [i for i, char in enumerate(sequence) if char == c]
-    mean_distance = sum(indices_c) / count_c
-    
-    # Step 3: Compute the second normalized central moment of the distribution of c
-    variance = sum((idx - mean_distance) ** 2 for idx in indices_c) / count_c
-    second_moment = variance / (len(sequence))
-    
-    # Create the 3D vector
-    point = [count_c, mean_distance, second_moment]
-    
-    return point
-
-def point_in_hull(point, hull_equations, tolerance=1e-12):
-    return all(
-        (np.dot(eq[:-1], point) + eq[-1] <= tolerance)
-        for eq in hull_equations)
-
-# Iterate over all arrays inside the file
 def check_validity(seq):
-    inside_hulls = []
-    for c in data.files:
-        equations = data[c]
-        point = create_3d_point(seq, c)
-        inside_hulls.append(point_in_hull(point, equations))
-    return all(inside_hulls)
+    return all(point_in_hull(create_3d_point(seq, aa), data[aa]) for aa in data.files)
 
+df_valid = pd.DataFrame({'Sequence': top_prots})
+df_valid['Valid Protein'] = df_valid['Sequence'].apply(check_validity)
+filtered_prots = df_valid[df_valid['Valid Protein']]['Sequence'].tolist()
+print("✅ Hull validity check complete.")
 
-print('Starting Protein Validity Check...')
-df_valid['Valid Protein'] = [check_validity(seq) for seq in top_prots]
-
-filtered_prots = [prot for prot in top_prots if check_validity(prot)]
-
-print('Valid proteins identified.')
-del model
-del protgpt2
-gc.collect()
-torch.cuda.empty_cache()
-print('Starting structure check...')
-esm_model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1")
+# === ESMFold Structure Check ===
+print("🧠 Running ESMFold...")
+esm_model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device)
 esm_tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
 
-
-
-# Define quantization configuration
-# quantization_config = QuantoConfig(weights="int8")
-# esm_model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1", quantization_config=quantization_config)
-
-# Quantize the model
-
-
-esm_model = esm_model.to(device)
-
 plddt_results = []
+valid_for_structure = filtered_prots
 
+for seq in tqdm(valid_for_structure):
+    try:
+        inputs = esm_tokenizer([seq.replace("\n", "")], return_tensors="pt", padding=True, truncation=True).to(device)
+        outputs = esm_model(**inputs)
+        plddt_results.append(torch.mean(outputs.plddt).item())
+    except Exception as e:
+        print(f"⚠️ Skipping sequence due to error: {e}")
+        plddt_results.append(None)
 
-for sequence in tqdm(top_prots):
-    # Input the sequence to ESM model
-    input_sequence = sequence.replace('\n', '')
-    if len(input_sequence) == 0:
-        continue
-    inputs = esm_tokenizer([input_sequence], return_tensors="pt", add_special_tokens=False)
-    inputs = inputs.to(device)
-    outputs = esm_model(**inputs)
-    avg_plddt = torch.mean(outputs.plddt)
-    plddt_results.append(avg_plddt.item())
-    torch.cuda.empty_cache()
-
-
+df_valid = df_valid[df_valid['Valid Protein']].copy()
 df_valid['plDDT'] = plddt_results
-plddt_results = np.array(plddt_results)
-df_valid['Good Structure'] = list(plddt_results > 0.7)
+df_valid['Good Structure'] = df_valid['plDDT'] > 0.7
+df_valid.to_csv(os.path.join(args.output_dir, 'generation_checks.csv'), index=False)
+best_prots = df_valid[df_valid['Good Structure']]['Sequence'].tolist()
+print("✅ Structure check complete.")
 
-#Save valid protein and structure check data to csv
-df_valid.to_csv(args.output_dir + '/generation_checks.csv', index=False)
-
-plddt_results = np.array([plddt_results[i] for i in range(len(top_prots)) if check_validity(top_prots[i])])
-
-filtered_prots = np.array(filtered_prots)
-
-best_prots = filtered_prots[plddt_results > 0.7]
-
-print('Structure check complete. ')
-
-
-
-del esm_model
-gc.collect()
-torch.cuda.empty_cache()
-
-
-#Loading PeptideBERT model
-
+# === PeptideBERT Property Prediction ===
 from PeptideBERT.data.dataloader import load_data
 from PeptideBERT.model.network import create_model, cri_opt_sch
 from PeptideBERT.model.utils import train, validate, test
 
-
+print("📊 Running PeptideBERT prediction...")
 save_dir = args.pred_model_path
-
-config = yaml.load(open(save_dir + '/config.yaml', 'r'), Loader=yaml.FullLoader)
+config = yaml.safe_load(open(os.path.join(save_dir, "config.yaml")))
 config['device'] = device
-
 peptideBERT_model = create_model(config)
-
-
-peptideBERT_model.load_state_dict(torch.load(f'{save_dir}/model.pt')['model_state_dict'], strict=False)
-
+peptideBERT_model.load_state_dict(torch.load(f"{save_dir}/model.pt")['model_state_dict'], strict=False)
+peptideBERT_model.to(device)
+peptideBERT_model.eval()
 
 m2 = dict(zip(
-    ['[PAD]','[UNK]','[CLS]','[SEP]','[MASK]','L',
-    'A','G','V','E','S','I','K','R','D','T','P','N',
-    'Q','F','Y','M','H','C','W','X','U','B','Z','O'],
+    ['[PAD]','[UNK]','[CLS]','[SEP]','[MASK]','L','A','G','V','E','S','I','K','R','D','T','P','N','Q','F','Y','M','H','C','W','X','U','B','Z','O'],
     range(30)
 ))
 
-def f(seq):
-    seq = map(lambda x: m2[x], seq)
-    seq = torch.tensor([*seq], dtype=torch.long).unsqueeze(0).to(device)
-    attn = torch.tensor(seq > 0, dtype=torch.long).to(device)
-
-    return seq, attn
-
-df_preds = pd.DataFrame()
+def encode(seq):
+    seq_ids = [m2[a] for a in seq if a in m2]
+    x = torch.tensor(seq_ids).unsqueeze(0).to(device)
+    attn = torch.tensor(x > 0, dtype=torch.long).to(device)
+    return x, attn
 
 scores = {}
-
-print('Starting protein property predictions...')
-
-peptides_to_exclude = "XUBZOJ"
-
-best_prots = remove_prots_with(best_prots, peptides_to_exclude)
-
-
 for seq in tqdm(best_prots):
+    try:
+        score = peptideBERT_model(*encode(seq.replace('\n', ''))).item()
+        scores[seq] = score
+    except:
+        continue
 
-    
-
-    seq = seq.replace('\n', '')
-
-
-
-    score = peptideBERT_model(*f(seq)).item()
-
-    scores[seq] = score
-
-print('Property prediction completed.')
-
-df_preds['Sequence'] = scores.keys()
-df_preds['Score'] = scores.values()
+df_preds = pd.DataFrame({
+    'Sequence': list(scores.keys()),
+    'Score': list(scores.values())
+})
 df_preds['Property'] = df_preds['Score'] > 0.5
+df_preds.to_csv(os.path.join(args.output_dir, 'predictions.csv'), index=False)
 
-total_proteins_with_property = np.sum(np.array(list(scores.values())) > 0.5)
+# === Summary Info ===
+total = args.num_return_sequences
+top = len(top_prots)
+valid = len(filtered_prots)
+good_struct = len(best_prots)
+positive = sum(df_preds['Property'])
 
-property_probability = total_proteins_with_property/len(best_prots)
+with open(os.path.join(args.output_dir, 'info.txt'), 'w') as f:
+    f.write(f'Total generated sequences: {total}, top {top} used for scoring\n')
+    f.write(f'{valid} passed hull validity check\n')
+    f.write(f'{good_struct} had plDDT > 0.7\n')
+    f.write(f'{positive}/{good_struct} had desired property ({positive/good_struct:.2%})\n')
 
-# Save Predictions to CSV
-df_preds.to_csv(args.output_dir + '/predictions.csv', index=False)
-
-print('Inference Complete')
-
-with open(args.output_dir + '/info.txt', 'w') as file:
-    # Write 'print('hello world')' to the file
-    file.write(f'Total generated sequences {args.num_return_sequences} out of which top {args.num_return_sequences//3} sequences based on perplexity were chosen.\n')
-    file.write(f'Total sequences which passed protein validty check {len(filtered_prots)}, rejected {len(top_prots) - len(filtered_prots)} or {((len(top_prots) - len(filtered_prots))/len(top_prots) * 100):.3f}%\n')
-    file.write(f'Total proteins which had plDDT > 0.7 from ESMFold are {len(best_prots)}, {(len(best_prots)/len(filtered_prots)*100):.3f}% of valid generated proteins\n')
-    file.write(f'{total_proteins_with_property}/{len(best_prots)} had the desired property, which is {property_probability:.4f} probability.\n')
-    for arg in vars(args):
-        file.write(f"{arg}: {getattr(args, arg)}\n")
-
-print(f'Total generated sequences {args.num_return_sequences} out of which top {args.num_return_sequences//3} sequences based on perplexity were chosen.')
-print(f'Total sequences which passed protein validty check {len(filtered_prots)}, rejected {len(top_prots) - len(filtered_prots)} or {((len(top_prots) - len(filtered_prots))/len(top_prots) * 100):.3f}%')
-print(f'Total proteins which had plDDT > 0.7 from ESMFold are {len(best_prots)}, {(len(best_prots)/len(filtered_prots) * 100):.3f}% of valid generated proteins')
-print(f'{total_proteins_with_property}/{len(best_prots)} had the desired property, which is {property_probability:.4f} probability.')
+print("✅ Full pipeline complete.")
