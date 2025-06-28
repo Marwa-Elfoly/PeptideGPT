@@ -212,7 +212,8 @@ for sequence in tqdm(top_prots):
     input_sequence = sequence.replace('\n', '')
     if len(input_sequence) == 0:
         continue
-    inputs = esm_tokenizer([input_sequence], return_tensors="pt", add_special_tokens=False)
+    inputs = esm_tokenizer([input_sequence], return_tensors="pt", add_special_tokens=False, padding=True, truncation=True, max_length=1024,      # match ESMFold’s max_position_embeddings
+)  # match ESMFold’s max_position_embeddings)
     inputs = inputs.to(device)
     outputs = esm_model(**inputs)
     avg_plddt = torch.mean(outputs.plddt)
