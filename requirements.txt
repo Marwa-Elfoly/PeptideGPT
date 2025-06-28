@@ -1,6 +1,6 @@
 numpy==1.25.2
 torch==2.0.1
-transformers==4.31.0
+transformers==4.53.0 
 tqdm==4.66.0
 pandas
 datasets
