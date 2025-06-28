@@ -200,50 +200,46 @@ esm_tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
 # esm_model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1", quantization_config=quantization_config)
 
 # Quantize the model
-esm_model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1")
-# ▶️ Put it in eval mode (disables training‐only modules and buffers)
-esm_model.eval()  
-# ▶️ Cast to half precision to cut memory roughly in half
-esm_model.half()  
-# ▶️ Move to GPU
+
+
 esm_model = esm_model.to(device)
 
 plddt_results = []
 
+
 for sequence in tqdm(top_prots):
+    # Input the sequence to ESM model
     input_sequence = sequence.replace('\n', '')
     if len(input_sequence) == 0:
         continue
+    inputs = esm_tokenizer([input_sequence], return_tensors="pt", add_special_tokens=False)
+    inputs = inputs.to(device)
+    outputs = esm_model(**inputs)
+    avg_plddt = torch.mean(outputs.plddt)
+    plddt_results.append(avg_plddt.item())
+    torch.cuda.empty_cache()
 
-    # ▶️ Wrap inference in no_grad to avoid building a computation graph
-    with torch.no_grad():
-        # ▶️ Enable padding & truncation so all batches line up and we don't allocate huge ragged tensors
-        inputs = esm_tokenizer(
-            [input_sequence],
-            return_tensors="pt",
-            padding=True,          # ✅ Added
-            truncation=True,       # ✅ Added
-            add_special_tokens=False
-        ).to(device)
 
-        # This is the big memory sink
-        outputs = esm_model(**inputs)
-
-        # pLDDT is already in the outputs
-        avg_plddt = torch.mean(outputs.plddt).item()
-
-    plddt_results.append(avg_plddt)
-    # ▶️ Immediately clear any leftovers
-    torch.cuda.empty_cache()  # ✅ Added
-
-# Put your results back into the dataframe
 df_valid['plDDT'] = plddt_results
-df_valid['Good Structure'] = df_valid['plDDT'] > 0.7
-df_valid.to_csv(os.path.join(args.output_dir, 'generation_checks.csv'), index=False)
+plddt_results = np.array(plddt_results)
+df_valid['Good Structure'] = list(plddt_results > 0.7)
 
-best_prots = df_valid[df_valid['Good Structure']]['Sequence'].tolist()
+#Save valid protein and structure check data to csv
+df_valid.to_csv(args.output_dir + '/generation_checks.csv', index=False)
+
+plddt_results = np.array([plddt_results[i] for i in range(len(top_prots)) if check_validity(top_prots[i])])
+
+filtered_prots = np.array(filtered_prots)
+
+best_prots = filtered_prots[plddt_results > 0.7]
 
 print('Structure check complete. ')
+
+
+
+del esm_model
+gc.collect()
+torch.cuda.empty_cache()
 
 
 #Loading PeptideBERT model
