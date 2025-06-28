@@ -1,9 +1,8 @@
  numpy==1.25.2
  torch==2.0.1
--transformers==4.53.0 
-+t ransformers==4.31.0
-+tokenizers==0.13.3
-+torchvision==0.15.2
+ ransformers==4.31.0
+ tokenizers==0.13.3
+ torchvision==0.15.2
  tqdm==4.66.0
  pandas
  datasets
